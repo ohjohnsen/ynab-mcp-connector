@@ -9,6 +9,8 @@ All endpoints use the official YNAB API v1.85.0 terminology (/plans/ not /budget
 from __future__ import annotations
 
 import base64
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 import hashlib
 import hmac
@@ -241,11 +243,41 @@ def get_ynab_api_key_from_bearer_header(authorization: str | None) -> str:
     )
 
 
+def _startup_banner() -> str:
+    """Render an ASCII banner with the running version, for quick identification
+    in logs (e.g. Portainer) without having to query /mcp/health.
+    """
+    letters = {
+        "Y": ["#   #", " # # ", "  #  ", "  #  ", "  #  "],
+        "N": ["#   #", "##  #", "# # #", "#  ##", "#   #"],
+        "A": [" ### ", "#   #", "#####", "#   #", "#   #"],
+        "B": ["#### ", "#   #", "#### ", "#   #", "#### "],
+    }
+    art_rows = ["  ".join(letters[ch][row] for ch in "YNAB") for row in range(5)]
+    oauth_enabled = bool(settings.oauth_client_id and settings.oauth_client_secret)
+    oauth_label = (
+        "OAuth: enabled" if oauth_enabled else "OAuth: disabled (direct bearer token mode)"
+    )
+    content = [*art_rows, "", "MCP CONNECTOR", f"v{settings.mcp_version}", oauth_label]
+    width = max(len(line) for line in content) + 4
+    top, bottom = "╔" + "═" * width + "╗", "╚" + "═" * width + "╝"
+    body = "\n".join(f"║{line.center(width)}║" for line in content)
+    return "\n".join([top, body, bottom])
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    """Print the version banner once the app is ready to serve."""
+    print(_startup_banner(), flush=True)
+    yield
+
+
 # Create FastAPI application
 app = FastAPI(
     title=settings.mcp_name,
     version=settings.mcp_version,
     description="YNAB MCP Connector - Interact with You Need A Budget API v1",
+    lifespan=_lifespan,
 )
 
 
