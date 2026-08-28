@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     # OAuth Configuration (for Claude.ai MCP integration)
     oauth_client_id: str = ""
     oauth_client_secret: str = ""
-    oauth_redirect_uri: str = "https://claude.ai/api/mcp/auth_callback"
+    oauth_redirect_uris: str = "https://claude.ai/api/mcp/auth_callback"
 
     # Server Configuration
     server_host: str = "0.0.0.0"
@@ -50,6 +50,11 @@ class Settings(BaseSettings):
     # MCP Configuration
     mcp_name: str = "YNAB Connector"
     mcp_version: str = _default_connector_version()
+
+    @property
+    def oauth_redirect_uri_list(self) -> list[str]:
+        """Registered redirect URIs, parsed from a comma-separated env var."""
+        return [uri.strip() for uri in self.oauth_redirect_uris.split(",") if uri.strip()]
 
     @property
     def ynab_headers(self) -> dict[str, str]:

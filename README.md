@@ -97,7 +97,7 @@ Relevant endpoints:
 | GET | `/oauth/authorize` | Authorization endpoint (redirects with a code) |
 | POST | `/oauth/token` | Token endpoint — `authorization_code` and `refresh_token` grants |
 
-The registered redirect URI defaults to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`), overridable via `OAUTH_REDIRECT_URI`.
+The registered redirect URIs default to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`), overridable via `OAUTH_REDIRECT_URIS` (comma-separated list, e.g. to also allow a local debug callback).
 
 In this mode, the YNAB API key lives only in the server's `.env` — it is never passed by the client.
 
@@ -121,7 +121,7 @@ Authorization: Bearer <your_ynab_personal_access_token>
 | `YNAB_API_URL` | No | `https://api.ynab.com/v1` | YNAB API base URL (v1.85.0) |
 | `OAUTH_CLIENT_ID` | No (enables OAuth mode when set with secret) | `""` | Client ID issued to MCP clients connecting via OAuth |
 | `OAUTH_CLIENT_SECRET` | No (enables OAuth mode when set) | `""` | Shared secret; also used as the HMAC signing key for issued tokens |
-| `OAUTH_REDIRECT_URI` | No | `https://claude.ai/api/mcp/auth_callback` | Registered OAuth redirect URI |
+| `OAUTH_REDIRECT_URIS` | No | `https://claude.ai/api/mcp/auth_callback` | Registered OAuth redirect URIs (comma-separated) |
 | `SERVER_HOST` | No | `0.0.0.0` | Server host address |
 | `SERVER_PORT` | No | `8000` | Server port |
 | `MCP_NAME` | No | `YNAB Connector` | MCP server name |

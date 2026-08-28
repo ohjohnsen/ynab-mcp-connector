@@ -30,6 +30,28 @@ from ynab_client import YNABClient
 
 
 # ============================================================================
+# Request Helpers
+# ============================================================================
+
+def _external_base_url(request: Request) -> str:
+    """Resolve the externally visible base URL (scheme + host), no trailing slash.
+
+    `request.base_url` reflects the scheme/host of the connection uvicorn
+    actually received. Behind a reverse proxy (e.g. Nginx Proxy Manager)
+    that terminates TLS and forwards plain HTTP, that means "http", even
+    though the client reached us over "https" — unless uvicorn's
+    ProxyHeadersMiddleware is configured to trust the proxy's IP, which
+    varies per deployment. Read the standard forwarded headers directly
+    instead, falling back to the raw connection info when absent (e.g.
+    local development without a proxy).
+    """
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+    default_host = request.headers.get("host", request.url.netloc)
+    host = request.headers.get("x-forwarded-host", default_host).split(",")[0].strip()
+    return f"{proto}://{host}"
+
+
+# ============================================================================
 # Validation Helpers
 # ============================================================================
 
@@ -352,7 +374,7 @@ async def oauth_protected_resource_metadata(request: Request) -> dict[str, Any]:
     Tells clients which authorization server issues tokens for this resource.
     Claude.ai uses this to discover the OAuth flow after receiving a 401.
     """
-    base_url = str(request.base_url).rstrip("/")
+    base_url = _external_base_url(request)
     return {
         "resource": f"{base_url}/mcp",
         "authorization_servers": [base_url],
@@ -362,7 +384,7 @@ async def oauth_protected_resource_metadata(request: Request) -> dict[str, Any]:
 @app.get("/.well-known/oauth-authorization-server")
 async def oauth_server_metadata(request: Request) -> dict[str, Any]:
     """OAuth 2.0 Authorization Server Metadata (RFC 8414)."""
-    base_url = str(request.base_url).rstrip("/")
+    base_url = _external_base_url(request)
     return {
         "issuer": base_url,
         "authorization_endpoint": f"{base_url}/oauth/authorize",
@@ -398,11 +420,11 @@ async def oauth_authorize(request: Request) -> Response:
         logger.warning("OAuth authorize rejected: client_id mismatch (got %r, expected %r)", client_id, settings.oauth_client_id)
         return JSONResponse(status_code=400, content={"error": "invalid_client", "error_description": "Unknown client_id"})
 
-    if redirect_uri != settings.oauth_redirect_uri:
-        logger.warning("OAuth authorize rejected: redirect_uri mismatch (got %r, configured %r)", redirect_uri, settings.oauth_redirect_uri)
+    if redirect_uri not in settings.oauth_redirect_uri_list:
+        logger.warning("OAuth authorize rejected: redirect_uri mismatch (got %r, configured %r)", redirect_uri, settings.oauth_redirect_uri_list)
         return JSONResponse(
             status_code=400,
-            content={"error": "invalid_redirect_uri", "error_description": f"Registered redirect URI: {settings.oauth_redirect_uri}"},
+            content={"error": "invalid_redirect_uri", "error_description": f"Registered redirect URIs: {', '.join(settings.oauth_redirect_uri_list)}"},
         )
 
     if response_type != "code":
@@ -511,7 +533,7 @@ async def mcp_handler(request: Request) -> JSONResponse:
         )
     
     authorization = request.headers.get("authorization")
-    base_url = str(request.base_url).rstrip("/")
+    base_url = _external_base_url(request)
     www_auth = f'Bearer resource_metadata="{base_url}/.well-known/oauth-protected-resource"'
 
     def _auth_401(detail: str, req_id: Any) -> JSONResponse:
