@@ -16,7 +16,7 @@ _env_file = ".env" if Path(".env").exists() else None
 
 def _default_connector_version() -> str:
     """Read connector version from pyproject.toml with a safe fallback."""
-    fallback_version = "0.4.6"
+    fallback_version = "0.5.0"
     try:
         pyproject_path = Path(__file__).with_name("pyproject.toml")
         data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
@@ -42,6 +42,14 @@ class Settings(BaseSettings):
     oauth_client_id: str = ""
     oauth_client_secret: str = ""
     oauth_redirect_uris: str = "https://claude.ai/api/mcp/auth_callback"
+
+    # Secret the owner types on the consent screen to approve a dynamically
+    # registered client (RFC 7591). Defaults to oauth_client_secret. Without
+    # this gate, anyone who knows the server URL could self-register and mint
+    # tokens, since dynamic registration is unauthenticated by design.
+    oauth_consent_secret: str = ""
+    # Set to false to reject dynamic client registration entirely.
+    oauth_dynamic_registration_enabled: bool = True
 
     # Server Configuration
     server_host: str = "0.0.0.0"

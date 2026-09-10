@@ -1,6 +1,6 @@
 [project]
 name = "ynab-mcp-connector"
-version = "0.4.6"
+version = "0.5.0"
 description = "A YNAB (You Need A Budget) MCP Connector for Mistral"
 readme = "README.md"
 requires-python = ">=3.13"
