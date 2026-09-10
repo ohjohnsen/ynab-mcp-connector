@@ -359,6 +359,7 @@ app = FastAPI(
 # ============================================================================
 
 @app.get("/.well-known/mcp/server-card")
+@app.get("/.well-known/mcp/server-card/mcp")
 async def server_card(request: Request) -> dict[str, Any]:
     """MCP Server Card for discovery.
     
