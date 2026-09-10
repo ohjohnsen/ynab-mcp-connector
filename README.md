@@ -47,12 +47,19 @@ This installs all required dependencies:
 
 ### 3. Configure `.env`
 
-Create a `.env` file in the project root:
+Copy the annotated example and fill in your own values:
+
+```bash
+cp .env.example .env
+```
+
+At minimum:
 
 ```env
 YNAB_API_KEY=your_ynab_personal_access_token
 OAUTH_CLIENT_ID=choose_any_client_id
 OAUTH_CLIENT_SECRET=choose_any_client_secret
+OAUTH_CONSENT_SECRET=choose_any_approval_secret
 ```
 
 See [Authentication](#authentication) below for what these do and when `OAUTH_CLIENT_ID`/`OAUTH_CLIENT_SECRET` are needed.
@@ -69,33 +76,38 @@ The server will start on `http://0.0.0.0:8000` with auto-reload enabled.
 
 ```bash
 curl http://localhost:8000/mcp/health
-# {"status":"healthy","version":"0.4.6"}
+# {"status":"healthy","version":"0.5.0"}
 
 curl http://localhost:8000/mcp/info
-# {"name":"YNAB Connector","version":"0.4.6",...}
+# {"name":"YNAB Connector","version":"0.5.0",...}
 ```
 
 ## Authentication
 
 This connector supports two authentication modes, chosen automatically based on whether `OAUTH_CLIENT_SECRET` is set.
 
-### Mode 1: OAuth 2.0 (for Claude.ai and other MCP clients that require OAuth)
+### Mode 1: OAuth 2.1 (for Claude.ai, Mistral and other MCP clients that require OAuth)
 
 Set `OAUTH_CLIENT_ID` and `OAUTH_CLIENT_SECRET` in `.env` (any values you choose) along with `YNAB_API_KEY`. The connector then:
 
-- Implements the **Authorization Code + PKCE (S256)** flow required by Claude.ai
-- Auto-approves and redirects immediately — there is no consent page, since this connector is single-owner
+- Implements the **Authorization Code + PKCE (S256)** flow required by OAuth 2.1 clients
+- Supports **Dynamic Client Registration (RFC 7591)**, required by clients such as Mistral that do not accept a pre-shared client ID
 - Issues self-verifying, HMAC-signed access tokens (1 hour) and refresh tokens (30 days) — no server-side session state, so tokens survive server restarts
-- Returns a real HTTP `401` with a `WWW-Authenticate` header on unauthenticated MCP requests, so OAuth-aware clients can discover the flow
+- Returns a real HTTP `401` with a `WWW-Authenticate: Bearer resource_metadata="…"` header on **any** unauthenticated MCP request — including `GET /mcp` and `initialize` — so OAuth-aware clients can auto-detect and discover the flow
+
+**Consent:** the pre-configured client (`OAUTH_CLIENT_ID`) is auto-approved, since this connector is single-owner. Dynamically registered clients are *not* — registration is unauthenticated by design, so anyone who knows your URL could otherwise register a client and mint tokens for your YNAB account. Instead, `/oauth/authorize` shows a consent page that requires the approval secret (`OAUTH_CONSENT_SECRET`, defaulting to `OAUTH_CLIENT_SECRET`). Set `OAUTH_DYNAMIC_REGISTRATION_ENABLED=false` to turn dynamic registration off entirely.
 
 Relevant endpoints:
 
 | Method | Endpoint | Purpose |
 |--------|----------|---------|
-| GET | `/.well-known/oauth-protected-resource` | RFC 9728 — tells clients which auth server issues tokens for this resource |
-| GET | `/.well-known/oauth-authorization-server` | RFC 8414 — authorization server metadata |
-| GET | `/oauth/authorize` | Authorization endpoint (redirects with a code) |
+| GET | `/.well-known/oauth-protected-resource` | RFC 9728 — tells clients which auth server issues tokens for this resource (also served at `/.well-known/oauth-protected-resource/mcp`) |
+| GET | `/.well-known/oauth-authorization-server` | RFC 8414 — authorization server metadata (also served at `/.well-known/oauth-authorization-server/mcp`) |
+| POST | `/register` | RFC 7591 — dynamic client registration |
+| GET | `/oauth/authorize` | Authorization endpoint (consent page, or redirect with a code) |
+| POST | `/oauth/authorize` | Consent form submission |
 | POST | `/oauth/token` | Token endpoint — `authorization_code` and `refresh_token` grants |
+| GET | `/mcp` | Returns `401` + `WWW-Authenticate` so clients can auto-detect OAuth |
 
 The registered redirect URIs default to Claude.ai's callback (`https://claude.ai/api/mcp/auth_callback`), overridable via `OAUTH_REDIRECT_URIS` (comma-separated list, e.g. to also allow a local debug callback).
 
@@ -122,6 +134,8 @@ Authorization: Bearer <your_ynab_personal_access_token>
 | `OAUTH_CLIENT_ID` | No (enables OAuth mode when set with secret) | `""` | Client ID issued to MCP clients connecting via OAuth |
 | `OAUTH_CLIENT_SECRET` | No (enables OAuth mode when set) | `""` | Shared secret; also used as the HMAC signing key for issued tokens |
 | `OAUTH_REDIRECT_URIS` | No | `https://claude.ai/api/mcp/auth_callback` | Registered OAuth redirect URIs (comma-separated) |
+| `OAUTH_CONSENT_SECRET` | No | falls back to `OAUTH_CLIENT_SECRET` | Secret you type on the consent screen to approve a dynamically registered client |
+| `OAUTH_DYNAMIC_REGISTRATION_ENABLED` | No | `true` | Set to `false` to reject RFC 7591 dynamic client registration |
 | `SERVER_HOST` | No | `0.0.0.0` | Server host address |
 | `SERVER_PORT` | No | `8000` | Server port |
 | `MCP_NAME` | No | `YNAB Connector` | MCP server name |
@@ -157,7 +171,7 @@ The connector validates all input parameters and returns clear error messages:
 
 Invalid requests return JSON-RPC error responses with code `-32602` (Invalid params).
 
-Authentication failures on methods that require it (`tools/call`, `resources/list`, `resources/read`, `resources/write`) return a real HTTP `401` (with `WWW-Authenticate` in OAuth mode) rather than a JSON-RPC error body, so OAuth-aware clients can detect and trigger re-authentication. All other errors are returned as HTTP 200 with a JSON-RPC error body, per the MCP JSON-RPC convention.
+Authentication failures return a real HTTP `401` with a `WWW-Authenticate` header (in OAuth mode) rather than a JSON-RPC error body, so OAuth-aware clients can detect and trigger re-authentication. This applies to every MCP method, including `initialize`. All other errors are returned as HTTP 200 with a JSON-RPC error body, per the MCP JSON-RPC convention.
 
 ## MCP Integration
 
@@ -167,7 +181,7 @@ This connector implements the **Model Context Protocol (MCP)** specification usi
 
 - **Server Card**: `GET /.well-known/mcp/server-card`
 - **MCP Endpoint**: `POST /mcp` (JSON-RPC 2.0)
-- **OAuth Discovery**: `GET /.well-known/oauth-protected-resource`, `GET /.well-known/oauth-authorization-server` (see [Authentication](#authentication))
+- **OAuth Discovery**: `GET /.well-known/oauth-protected-resource`, `GET /.well-known/oauth-authorization-server`, `POST /register` (see [Authentication](#authentication))
 
 ### Resource URIs
 
@@ -399,6 +413,7 @@ For direct HTTP access (in addition to MCP JSON-RPC):
 | GET | `/.well-known/mcp/server-card` | MCP server discovery card |
 | GET | `/.well-known/oauth-protected-resource` | OAuth protected resource metadata (RFC 9728) |
 | GET | `/.well-known/oauth-authorization-server` | OAuth authorization server metadata (RFC 8414) |
+| POST | `/register` | OAuth dynamic client registration (RFC 7591) |
 | GET | `/oauth/authorize` | OAuth authorization endpoint |
 | POST | `/oauth/token` | OAuth token endpoint (`authorization_code`, `refresh_token` grants) |
 

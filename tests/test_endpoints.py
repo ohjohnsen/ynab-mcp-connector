@@ -77,5 +77,10 @@ class TestServerCardEndpoint:
         assert data["url"] == "/mcp"
         assert "auth" in data
         assert data["auth"]["type"] == "oauth2"
-        assert "tokenUrl" in data["auth"]["flows"]["clientCredentials"]
+        assert data["auth"]["version"] == "2.1"
+        auth_code_flow = data["auth"]["flows"]["authorizationCode"]
+        assert "tokenUrl" in auth_code_flow
+        assert "authorizationUrl" in auth_code_flow
+        assert "registrationUrl" in auth_code_flow
+        assert auth_code_flow["pkceRequired"] is True
         assert "capabilities" in data
