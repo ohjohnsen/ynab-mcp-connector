@@ -269,6 +269,69 @@ class TestTokenExchange:
         assert response.status_code == 401
 
 
+class TestClientSecretBasic:
+    """The pre-configured client may authenticate via an HTTP Basic header."""
+
+    def _static_code(self, client: TestClient, settings) -> str:
+        response = client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "client_id": settings.oauth_client_id,
+                "redirect_uri": REDIRECT_URI,
+                "code_challenge": _code_challenge(CODE_VERIFIER),
+                "code_challenge_method": "S256",
+            },
+        )
+        return response.headers["location"].split("code=", 1)[1].split("&")[0]
+
+    def _basic(self, user: str, password: str) -> str:
+        return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
+
+    def test_basic_header_is_accepted(self, oauth_client, oauth_settings):
+        code = self._static_code(oauth_client, oauth_settings)
+        response = oauth_client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": CODE_VERIFIER,
+                "redirect_uri": REDIRECT_URI,
+            },
+            headers={"Authorization": self._basic(
+                oauth_settings.oauth_client_id, oauth_settings.oauth_client_secret
+            )},
+        )
+        assert response.status_code == 200
+        assert response.json()["token_type"] == "Bearer"
+
+    def test_basic_header_with_wrong_secret_is_rejected(self, oauth_client, oauth_settings):
+        code = self._static_code(oauth_client, oauth_settings)
+        response = oauth_client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": CODE_VERIFIER,
+                "redirect_uri": REDIRECT_URI,
+            },
+            headers={"Authorization": self._basic(oauth_settings.oauth_client_id, "wrong")},
+        )
+        assert response.status_code == 401
+
+    def test_malformed_basic_header_is_rejected(self, oauth_client):
+        response = oauth_client.post(
+            "/oauth/token",
+            data={"grant_type": "authorization_code"},
+            headers={"Authorization": "Basic not-valid-base64!!"},
+        )
+        assert response.status_code == 401
+
+    def test_basic_is_advertised_in_metadata(self, oauth_client):
+        data = oauth_client.get("/.well-known/oauth-authorization-server").json()
+        assert "client_secret_basic" in data["token_endpoint_auth_methods_supported"]
+
+
 class TestProtocolVersionNegotiation:
     def test_echoes_supported_client_version(self, oauth_client):
         client_id = _register(oauth_client)

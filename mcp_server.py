@@ -21,7 +21,7 @@ import re
 import secrets
 import time
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, unquote_plus, urlencode, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +123,21 @@ def _check_client_secret(provided: str, stored: str) -> bool:
     if not provided or not stored:
         return False
     return secrets.compare_digest(provided, stored)
+
+
+def _basic_auth_credentials(authorization: str | None) -> tuple[str, str]:
+    """Decode an HTTP Basic Authorization header into (client_id, client_secret)."""
+    if not authorization or not authorization.strip().lower().startswith("basic "):
+        return "", ""
+    try:
+        raw = base64.b64decode(authorization.strip()[6:].strip(), validate=True).decode("utf-8")
+    except Exception:
+        return "", ""
+    if ":" not in raw:
+        return "", ""
+    client_id, client_secret = raw.split(":", 1)
+    # RFC 6749 requires the credentials be form-urlencoded before base64.
+    return unquote_plus(client_id), unquote_plus(client_secret)
 
 
 def _verify_pkce_s256(code_verifier: str, code_challenge: str) -> bool:
@@ -498,7 +513,7 @@ async def oauth_server_metadata(request: Request) -> dict[str, Any]:
         "token_endpoint": f"{base_url}/oauth/token",
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
+        "token_endpoint_auth_methods_supported": ["client_secret_basic", "client_secret_post", "none"],
         "response_types_supported": ["code"],
         "response_modes_supported": ["query"],
         "scopes_supported": ["ynab:read", "ynab:write"],
@@ -710,6 +725,13 @@ async def oauth_token(request: Request) -> JSONResponse:
     grant_type = _first("grant_type")
     client_id = _first("client_id")
     client_secret = _first("client_secret")
+
+    # Many OAuth 2.1 clients send credentials as an HTTP Basic header instead
+    # of form fields (RFC 6749 section 2.3.1), so fall back to that.
+    if not client_id or not client_secret:
+        basic_id, basic_secret = _basic_auth_credentials(request.headers.get("authorization"))
+        client_id = client_id or basic_id
+        client_secret = client_secret or basic_secret
 
     if _resolve_client_redirect_uris(client_id) is None:
         return JSONResponse(status_code=401, content={"error": "invalid_client"})
