@@ -67,6 +67,13 @@ class TestServerCardEndpoint:
         assert "version" in data
         assert "url" in data
 
+    def test_server_card_served_at_resource_suffixed_path(self, test_client):
+        """Clients probe the path-insertion form for a resource served at /mcp."""
+        response = test_client.get("/.well-known/mcp/server-card/mcp")
+
+        assert response.status_code == 200
+        assert response.json() == test_client.get("/.well-known/mcp/server-card").json()
+
     def test_server_card_returns_expected_structure(self, test_client, mock_settings):
         """Test that the server card returns expected MCP discovery format."""
         response = test_client.get("/.well-known/mcp/server-card")

@@ -76,10 +76,10 @@ The server will start on `http://0.0.0.0:8000` with auto-reload enabled.
 
 ```bash
 curl http://localhost:8000/mcp/health
-# {"status":"healthy","version":"0.5.1"}
+# {"status":"healthy","version":"0.5.2"}
 
 curl http://localhost:8000/mcp/info
-# {"name":"YNAB Connector","version":"0.5.1",...}
+# {"name":"YNAB Connector","version":"0.5.2",...}
 ```
 
 ## Authentication
