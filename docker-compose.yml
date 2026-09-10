@@ -13,6 +13,14 @@ services:
       - YNAB_API_KEY=changeme
       - OAUTH_CLIENT_ID=changeme
       - OAUTH_CLIENT_SECRET=changeme
+      # Typed into the consent screen to approve a dynamically registered
+      # client. Defaults to OAUTH_CLIENT_SECRET if omitted.
+      - OAUTH_CONSENT_SECRET=changeme
+      # Set to false to allow only the pre-configured client above.
+      - OAUTH_DYNAMIC_REGISTRATION_ENABLED=true
+      # Redirect URIs for the pre-configured client (comma-separated).
+      # Clients that register dynamically supply their own.
+      - OAUTH_REDIRECT_URIS=https://claude.ai/api/mcp/auth_callback
 
     # Health check
     healthcheck:
@@ -26,27 +34,36 @@ services:
 # =====================
 #
 # 1. PORT FORWARDING
-#    - Using standard bridge network with port mapping 8000:8000
-#    - The connector will be accessible at: http://<NAS_IP>:8000
+#    - Using standard bridge network with port mapping 8088:8000
+#    - The connector will be accessible at: http://<NAS_IP>:8088
 #
 # 2. REQUIRED CONFIGURATION
 #    - YNAB_API_KEY: your YNAB personal access token.
 #      Get one from: https://app.youneedabudget.com/settings/personalAccessTokens
 #    - OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET: credentials for the OAuth flow
-#      used by MCP clients (e.g. Claude.ai) connecting to this server.
-#      Pick any values you like — the connector just compares what it issued
-#      against what it receives back.
+#      used by MCP clients you configure by hand (e.g. Claude.ai). Pick any
+#      values you like — the connector just compares what it issued against
+#      what it receives back. OAUTH_CLIENT_SECRET is also the HMAC key that
+#      signs every issued token, so changing it forces all clients to
+#      re-authorize.
+#    - OAUTH_CONSENT_SECRET: clients that only ask for a server URL (e.g.
+#      Mistral) register themselves via OAuth dynamic client registration,
+#      which is unauthenticated by design. Such clients are therefore not
+#      auto-approved: /oauth/authorize shows a consent page asking for this
+#      secret. See .env.example for the full list of settings.
 #
 # 3. USAGE
 #    - Start: docker-compose up -d
 #    - Stop: docker-compose down
 #    - View logs: docker-compose logs -f
-#    - Test: curl http://localhost:8000/mcp/health  (or use docker inspect to see healthcheck status)
+#    - Test: curl http://localhost:8088/mcp/health  (or use docker inspect to see healthcheck status)
 #
 # 4. MCP CLIENT CONFIGURATION
-#    In Claude.ai, add the connector with URL:
-#    http://<NAS_IP>:8000/mcp
+#    Add the connector using the /mcp endpoint, e.g. http://<NAS_IP>:8088/mcp,
 #    and complete the OAuth authorization flow when prompted.
+#    Most hosted clients (Claude.ai, Mistral) require a publicly reachable
+#    HTTPS URL with a valid certificate, so put a reverse proxy in front
+#    rather than exposing the container port directly.
 #
 # 5. CUSTOM PORT
 #    To use a different external port (e.g., 9000):

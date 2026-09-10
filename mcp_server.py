@@ -14,18 +14,19 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 import hashlib
 import hmac
+import html
 import json
 import logging
 import re
 import secrets
 import time
 from typing import Any
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 
 logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from config import settings
 from ynab_client import YNABClient
@@ -115,6 +116,7 @@ def _validate_required_param(param: Any, param_name: str, expected_type: type | 
 _OAUTH_TOKEN_EXPIRY_SECONDS = 3600
 _OAUTH_REFRESH_TOKEN_EXPIRY_SECONDS = 30 * 24 * 3600  # 30 days
 _AUTH_CODE_EXPIRY_SECONDS = 300  # 5 minutes
+_CLIENT_REGISTRATION_EXPIRY_SECONDS = 10 * 365 * 24 * 3600  # effectively non-expiring
 
 
 def _check_client_secret(provided: str, stored: str) -> bool:
@@ -160,7 +162,7 @@ def _decode_signed_token(token: str) -> dict[str, Any] | None:
         return None
 
 
-def _create_auth_code(client_id: str, redirect_uri: str, code_challenge: str, scope: str) -> str:
+def _create_auth_code(client_id: str, redirect_uri: str, code_challenge: str, scope: str, is_public: bool) -> str:
     """Create a self-verifying auth code (survives server restarts)."""
     return _make_signed_token({
         "typ": "code",
@@ -168,6 +170,7 @@ def _create_auth_code(client_id: str, redirect_uri: str, code_challenge: str, sc
         "redirect_uri": redirect_uri,
         "code_challenge": code_challenge,
         "scope": scope,
+        "pub": is_public,
         "exp": int(time.time()) + _AUTH_CODE_EXPIRY_SECONDS,
         "nti": secrets.token_urlsafe(8),
     })
@@ -190,11 +193,66 @@ def _create_refresh_token() -> str:
         "jti": secrets.token_urlsafe(16),
     })
 
-
 def _verify_access_token(token: str) -> bool:
     """Return True if the token is a valid, unexpired access token."""
     payload = _decode_signed_token(token)
     return payload is not None and payload.get("typ") == "access"
+
+
+def _oauth_enabled() -> bool:
+    """True when the connector runs in OAuth mode rather than direct-bearer mode."""
+    return bool(settings.oauth_client_id and settings.oauth_client_secret)
+
+
+def _create_client_id(redirect_uris: list[str]) -> str:
+    """Create a self-describing client_id for a dynamically registered client.
+
+    The registration is encoded into the client_id itself and signed, so no
+    server-side client store is needed and registrations survive restarts.
+    """
+    return _make_signed_token({
+        "typ": "client",
+        "redirect_uris": redirect_uris,
+        "exp": int(time.time()) + _CLIENT_REGISTRATION_EXPIRY_SECONDS,
+        "jti": secrets.token_urlsafe(8),
+    })
+
+
+def _resolve_client_redirect_uris(client_id: str) -> list[str] | None:
+    """Return allowed redirect URIs for a client_id, or None if the client is unknown."""
+    if not client_id:
+        return None
+    if settings.oauth_client_id and secrets.compare_digest(client_id, settings.oauth_client_id):
+        return settings.oauth_redirect_uri_list
+    payload = _decode_signed_token(client_id)
+    if payload and payload.get("typ") == "client":
+        uris = payload.get("redirect_uris")
+        if isinstance(uris, list):
+            return [str(uri) for uri in uris]
+    return None
+
+
+def _is_preconfigured_client(client_id: str) -> bool:
+    """True for the statically configured (confidential) client."""
+    return bool(settings.oauth_client_id) and secrets.compare_digest(client_id, settings.oauth_client_id)
+
+
+def _consent_secret() -> str:
+    """Shared secret the owner types to approve a dynamically registered client."""
+    return settings.oauth_consent_secret or settings.oauth_client_secret
+
+
+def _is_valid_redirect_uri(uri: str) -> bool:
+    """Allow only https redirect URIs, plus loopback for local development."""
+    try:
+        parsed = urlparse(uri)
+    except ValueError:
+        return False
+    if parsed.fragment or not parsed.netloc:
+        return False
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
 
 
 def get_ynab_api_key(
@@ -286,11 +344,12 @@ app = FastAPI(
 # ============================================================================
 
 @app.get("/.well-known/mcp/server-card")
-async def server_card() -> dict[str, Any]:
+async def server_card(request: Request) -> dict[str, Any]:
     """MCP Server Card for discovery.
     
     Allows MCP clients to discover the server.
     """
+    base_url = _external_base_url(request)
     return {
         "name": settings.mcp_name,
         "description": "YNAB MCP Connector - Interact with You Need A Budget API",
@@ -298,10 +357,20 @@ async def server_card() -> dict[str, Any]:
         "url": "/mcp",
         "auth": {
             "type": "oauth2",
+            "version": "2.1",
+            "authorization_servers": [base_url],
+            "resource_metadata": f"{base_url}/.well-known/oauth-protected-resource",
             "flows": {
-                "clientCredentials": {
-                    "tokenUrl": "/oauth/token",
-                    "scopes": {},
+                "authorizationCode": {
+                    "authorizationUrl": f"{base_url}/oauth/authorize",
+                    "tokenUrl": f"{base_url}/oauth/token",
+                    "registrationUrl": f"{base_url}/register",
+                    "pkceRequired": True,
+                    "codeChallengeMethods": ["S256"],
+                    "scopes": {
+                        "ynab:read": "Read YNAB plans, accounts and transactions",
+                        "ynab:write": "Create and modify YNAB transactions",
+                    },
                 }
             },
         },
@@ -400,74 +469,204 @@ async def server_card() -> dict[str, Any]:
 # ============================================================================
 
 @app.get("/.well-known/oauth-protected-resource")
+@app.get("/.well-known/oauth-protected-resource/mcp")
 async def oauth_protected_resource_metadata(request: Request) -> dict[str, Any]:
     """OAuth Protected Resource Metadata (RFC 9728).
 
     Tells clients which authorization server issues tokens for this resource.
-    Claude.ai uses this to discover the OAuth flow after receiving a 401.
+    Clients discover the OAuth flow here after receiving a 401. The
+    `/mcp`-suffixed path is the RFC 9728 path-insertion form some clients
+    (e.g. Mistral) probe for a resource served at `/mcp`.
     """
     base_url = _external_base_url(request)
     return {
         "resource": f"{base_url}/mcp",
         "authorization_servers": [base_url],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": ["ynab:read", "ynab:write"],
     }
 
 
 @app.get("/.well-known/oauth-authorization-server")
+@app.get("/.well-known/oauth-authorization-server/mcp")
 async def oauth_server_metadata(request: Request) -> dict[str, Any]:
-    """OAuth 2.0 Authorization Server Metadata (RFC 8414)."""
+    """OAuth 2.1 Authorization Server Metadata (RFC 8414)."""
     base_url = _external_base_url(request)
-    return {
+    metadata: dict[str, Any] = {
         "issuer": base_url,
         "authorization_endpoint": f"{base_url}/oauth/authorize",
         "token_endpoint": f"{base_url}/oauth/token",
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post"],
+        "token_endpoint_auth_methods_supported": ["client_secret_post", "none"],
         "response_types_supported": ["code"],
+        "response_modes_supported": ["query"],
+        "scopes_supported": ["ynab:read", "ynab:write"],
+    }
+    if settings.oauth_dynamic_registration_enabled:
+        metadata["registration_endpoint"] = f"{base_url}/register"
+    return metadata
+
+
+@app.post("/register")
+async def oauth_register(request: Request) -> JSONResponse:
+    """OAuth 2.0 Dynamic Client Registration (RFC 7591).
+
+    Required by clients that only support OAuth 2.1 with dynamic registration
+    (e.g. Mistral). Registration is unauthenticated per the RFC, so issued
+    clients are public clients: they must use PKCE *and* the resource owner
+    must approve them on the consent screen before any code is issued.
+    """
+    if not _oauth_enabled():
+        return JSONResponse(status_code=501, content={"error": "oauth_not_configured"})
+    if not settings.oauth_dynamic_registration_enabled:
+        return JSONResponse(
+            status_code=403,
+            content={"error": "access_denied", "error_description": "Dynamic client registration is disabled."},
+        )
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_client_metadata", "error_description": "Request body must be a JSON object."},
+        )
+
+    redirect_uris = body.get("redirect_uris")
+    if not isinstance(redirect_uris, list) or not redirect_uris or not all(isinstance(u, str) for u in redirect_uris):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_redirect_uri", "error_description": "redirect_uris must be a non-empty array of strings."},
+        )
+    if len(redirect_uris) > 5:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_redirect_uri", "error_description": "At most 5 redirect_uris may be registered."},
+        )
+    for uri in redirect_uris:
+        if not _is_valid_redirect_uri(uri):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_redirect_uri", "error_description": f"redirect_uri must be https (or loopback http): {uri}"},
+            )
+
+    requested_auth_method = body.get("token_endpoint_auth_method", "none")
+    if requested_auth_method not in ("none", None):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "invalid_client_metadata", "error_description": "Only token_endpoint_auth_method 'none' (public client + PKCE) is supported."},
+        )
+
+    client_id = _create_client_id(redirect_uris)
+    logger.info("OAuth dynamic client registered for redirect_uris=%r", redirect_uris)
+    return JSONResponse(status_code=201, content={
+        "client_id": client_id,
+        "client_id_issued_at": int(time.time()),
+        "client_name": body.get("client_name") or "Dynamically registered MCP client",
+        "redirect_uris": redirect_uris,
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+        "scope": "ynab:read ynab:write",
+    })
+
+
+def _consent_page(params: dict[str, str], error: str = "") -> HTMLResponse:
+    """Render the approval form shown for dynamically registered clients."""
+    hidden = "".join(
+        f'<input type="hidden" name="{html.escape(k)}" value="{html.escape(v)}">'
+        for k, v in params.items()
+    )
+    error_html = f'<p class="err">{html.escape(error)}</p>' if error else ""
+    redirect_uri = html.escape(params.get("redirect_uri", ""))
+    body = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>Authorize access</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+body{{font-family:system-ui,sans-serif;max-width:32rem;margin:4rem auto;padding:0 1rem}}
+.err{{color:#b00020}} code{{word-break:break-all}}
+input[type=password]{{width:100%;padding:.5rem;font-size:1rem}}
+button{{margin-top:1rem;padding:.6rem 1.2rem;font-size:1rem}}
+</style></head><body>
+<h1>Authorize access to your YNAB data</h1>
+<p>An application is requesting access to this YNAB connector and will be sent back to:</p>
+<p><code>{redirect_uri}</code></p>
+<p>Only continue if you started this. Enter the connector approval secret to allow it.</p>
+{error_html}
+<form method="post" action="/oauth/authorize">
+{hidden}
+<label for="s">Approval secret</label>
+<input id="s" type="password" name="consent_secret" autocomplete="current-password" autofocus>
+<button type="submit">Allow access</button>
+</form></body></html>"""
+    status = 401 if error else 200
+    return HTMLResponse(content=body, status_code=status)
+
+
+def _authorize_request_params(q: Any) -> dict[str, str]:
+    return {
+        "response_type": q.get("response_type", ""),
+        "client_id": q.get("client_id", ""),
+        "redirect_uri": q.get("redirect_uri", ""),
+        "code_challenge": q.get("code_challenge", ""),
+        "code_challenge_method": q.get("code_challenge_method", ""),
+        "state": q.get("state", ""),
+        "scope": q.get("scope", ""),
     }
 
 
-@app.get("/oauth/authorize")
-async def oauth_authorize(request: Request) -> Response:
-    """OAuth 2.0 Authorization endpoint.
-
-    Validates the request and immediately redirects back with an auth code.
-    No consent page — this is a single-owner connector.
+def _process_authorize(params: dict[str, str], consent_secret: str | None) -> Response:
+    """Validate an authorization request and either redirect with a code,
+    show the consent form, or return an error.
     """
     if not settings.oauth_client_id:
         return JSONResponse(status_code=501, content={"error": "oauth_not_configured"})
 
-    q = request.query_params
-    response_type = q.get("response_type", "")
-    client_id = q.get("client_id", "")
-    redirect_uri = q.get("redirect_uri", "")
-    code_challenge = q.get("code_challenge", "")
-    code_challenge_method = q.get("code_challenge_method", "")
-    state = q.get("state", "")
-    scope = q.get("scope", "")
+    client_id = params["client_id"]
+    redirect_uri = params["redirect_uri"]
+    state = params["state"]
 
     # Validate client_id before trusting redirect_uri (prevents open redirect)
-    if not secrets.compare_digest(client_id, settings.oauth_client_id):
-        logger.warning("OAuth authorize rejected: client_id mismatch (got %r, expected %r)", client_id, settings.oauth_client_id)
+    allowed_redirect_uris = _resolve_client_redirect_uris(client_id)
+    if allowed_redirect_uris is None:
+        logger.warning("OAuth authorize rejected: unknown client_id %r", client_id)
         return JSONResponse(status_code=400, content={"error": "invalid_client", "error_description": "Unknown client_id"})
 
-    if redirect_uri not in settings.oauth_redirect_uri_list:
-        logger.warning("OAuth authorize rejected: redirect_uri mismatch (got %r, configured %r)", redirect_uri, settings.oauth_redirect_uri_list)
+    if redirect_uri not in allowed_redirect_uris:
+        logger.warning("OAuth authorize rejected: redirect_uri mismatch (got %r, allowed %r)", redirect_uri, allowed_redirect_uris)
         return JSONResponse(
             status_code=400,
-            content={"error": "invalid_redirect_uri", "error_description": f"Registered redirect URIs: {', '.join(settings.oauth_redirect_uri_list)}"},
+            content={"error": "invalid_redirect_uri", "error_description": f"Registered redirect URIs: {', '.join(allowed_redirect_uris)}"},
         )
 
-    if response_type != "code":
+    if params["response_type"] != "code":
         qs = urlencode({"error": "unsupported_response_type", "state": state})
         return RedirectResponse(url=f"{redirect_uri}?{qs}", status_code=302)
 
-    if code_challenge_method != "S256" or not code_challenge:
+    if params["code_challenge_method"] != "S256" or not params["code_challenge"]:
         qs = urlencode({"error": "invalid_request", "error_description": "PKCE S256 required", "state": state})
         return RedirectResponse(url=f"{redirect_uri}?{qs}", status_code=302)
 
-    code = _create_auth_code(client_id, redirect_uri, code_challenge, scope)
+    # Dynamically registered clients are unauthenticated by definition, so the
+    # resource owner must explicitly approve them before a code is issued.
+    is_public = not _is_preconfigured_client(client_id)
+    if is_public:
+        expected = _consent_secret()
+        if not expected:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "server_error", "error_description": "No approval secret configured."},
+            )
+        if consent_secret is None:
+            return _consent_page(params)
+        if not secrets.compare_digest(consent_secret, expected):
+            logger.warning("OAuth consent rejected: bad approval secret for redirect_uri %r", redirect_uri)
+            return _consent_page(params, error="Incorrect approval secret.")
+
+    code = _create_auth_code(client_id, redirect_uri, params["code_challenge"], params["scope"], is_public)
 
     redirect_params: dict[str, str] = {"code": code}
     if state:
@@ -475,10 +674,28 @@ async def oauth_authorize(request: Request) -> Response:
     return RedirectResponse(url=f"{redirect_uri}?{urlencode(redirect_params)}", status_code=302)
 
 
+@app.get("/oauth/authorize")
+async def oauth_authorize(request: Request) -> Response:
+    """OAuth 2.1 authorization endpoint.
+
+    The pre-configured client is auto-approved (single-owner connector).
+    Dynamically registered clients must pass the consent screen first.
+    """
+    return _process_authorize(_authorize_request_params(request.query_params), consent_secret=None)
+
+
+@app.post("/oauth/authorize")
+async def oauth_authorize_consent(request: Request) -> Response:
+    """Handle submission of the consent form for a dynamically registered client."""
+    raw = (await request.body()).decode()
+    form = {k: (v[0] if v else "") for k, v in parse_qs(raw, keep_blank_values=True).items()}
+    return _process_authorize(_authorize_request_params(form), consent_secret=form.get("consent_secret", ""))
+
+
 @app.post("/oauth/token")
 async def oauth_token(request: Request) -> JSONResponse:
-    """OAuth 2.0 token endpoint — authorization_code grant with PKCE S256."""
-    if not settings.oauth_client_id or not settings.oauth_client_secret:
+    """OAuth 2.1 token endpoint — authorization_code (PKCE S256) and refresh_token grants."""
+    if not _oauth_enabled():
         return JSONResponse(
             status_code=501,
             content={"error": "oauth_not_configured", "error_description": "OAuth is not configured on this server."},
@@ -494,9 +711,51 @@ async def oauth_token(request: Request) -> JSONResponse:
     client_id = _first("client_id")
     client_secret = _first("client_secret")
 
-    if not secrets.compare_digest(client_id, settings.oauth_client_id) or \
-       not _check_client_secret(client_secret, settings.oauth_client_secret):
+    if _resolve_client_redirect_uris(client_id) is None:
         return JSONResponse(status_code=401, content={"error": "invalid_client"})
+
+    # Confidential (pre-configured) clients must present their secret; public
+    # clients issued via dynamic registration authenticate with PKCE instead.
+    is_public = not _is_preconfigured_client(client_id)
+    if not is_public and not _check_client_secret(client_secret, settings.oauth_client_secret):
+        return JSONResponse(status_code=401, content={"error": "invalid_client"})
+
+    if grant_type == "authorization_code":
+        code = _first("code")
+        code_verifier = _first("code_verifier")
+        redirect_uri = _first("redirect_uri")
+
+        pending = _decode_signed_token(code)
+        if not pending or pending.get("typ") != "code":
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_grant", "error_description": "Invalid or expired authorization code"},
+            )
+
+        if pending["client_id"] != client_id or pending["redirect_uri"] != redirect_uri:
+            return JSONResponse(status_code=400, content={"error": "invalid_grant"})
+
+        if not _verify_pkce_s256(code_verifier, pending["code_challenge"]):
+            return JSONResponse(
+                status_code=400,
+                content={"error": "invalid_grant", "error_description": "PKCE verification failed"},
+            )
+
+    elif grant_type == "refresh_token":
+        refresh_token = _first("refresh_token")
+        payload = _decode_signed_token(refresh_token)
+        if not payload or payload.get("typ") != "refresh":
+            return JSONResponse(status_code=400, content={"error": "invalid_grant"})
+
+    else:
+        return JSONResponse(status_code=400, content={"error": "unsupported_grant_type"})
+
+    return JSONResponse(content={
+        "access_token": _create_access_token(),
+        "refresh_token": _create_refresh_token(),
+        "token_type": "Bearer",
+        "expires_in": _OAUTH_TOKEN_EXPIRY_SECONDS,
+    })
 
     if grant_type == "authorization_code":
         code = _first("code")
@@ -540,7 +799,40 @@ async def oauth_token(request: Request) -> JSONResponse:
 # MCP JSON-RPC 2.0 Protocol Endpoint
 # ============================================================================
 
-MCP_PROTOCOL_VERSION = "2024-11-05"
+MCP_PROTOCOL_VERSION = "2025-06-18"
+SUPPORTED_MCP_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
+
+
+def _www_authenticate_header(request: Request) -> str:
+    """Build the WWW-Authenticate challenge advertising the OAuth 2.1 flow."""
+    realm = settings.mcp_name.replace('"', "")
+    if not _oauth_enabled():
+        return f'Bearer realm="{realm}"'
+    base_url = _external_base_url(request)
+    return (
+        f'Bearer realm="{realm}", '
+        f'resource_metadata="{base_url}/.well-known/oauth-protected-resource"'
+    )
+
+
+@app.get("/mcp")
+@app.head("/mcp")
+async def mcp_auth_challenge(request: Request) -> Response:
+    """Advertise the authentication scheme to clients probing the MCP endpoint.
+
+    Clients such as Mistral auto-detect the auth method by sending an
+    unauthenticated request and reading the `WWW-Authenticate` header of the
+    401 response, which points at the RFC 9728 resource metadata describing
+    the OAuth 2.1 authorization server.
+    """
+    return JSONResponse(
+        status_code=401,
+        content={
+            "error": "invalid_token",
+            "error_description": "Authorization required. Obtain an OAuth 2.1 bearer token.",
+        },
+        headers={"WWW-Authenticate": _www_authenticate_header(request)},
+    )
 
 
 @app.post("/mcp")
@@ -565,8 +857,7 @@ async def mcp_handler(request: Request) -> JSONResponse:
         )
     
     authorization = request.headers.get("authorization")
-    base_url = _external_base_url(request)
-    www_auth = f'Bearer resource_metadata="{base_url}/.well-known/oauth-protected-resource"'
+    www_auth = _www_authenticate_header(request)
 
     def _auth_401(detail: str, req_id: Any) -> JSONResponse:
         return JSONResponse(
@@ -606,7 +897,12 @@ async def _handle_rpc_request(
     method = request.get("method")
     params = request.get("params", {})
 
+    # Every MCP method requires a bearer token, per the MCP authorization spec.
+    # Returning 401 on `initialize` is what lets OAuth-aware clients discover
+    # the flow instead of assuming the server is unauthenticated.
     methods_requiring_auth = {
+        "initialize",
+        "tools/list",
         "tools/call",
         "resources/list",
         "resources/read",
@@ -667,10 +963,12 @@ async def _handle_initialize(
     params: dict[str, Any], request_id: Any
 ) -> dict[str, Any]:
     """Handle MCP initialize request."""
+    requested = params.get("protocolVersion")
+    negotiated = requested if requested in SUPPORTED_MCP_PROTOCOL_VERSIONS else MCP_PROTOCOL_VERSION
     return {
         "jsonrpc": "2.0",
         "result": {
-            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "protocolVersion": negotiated,
             "capabilities": {
                 "tools": {},
                 "resources": {
